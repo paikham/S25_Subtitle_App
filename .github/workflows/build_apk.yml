@@ -12,7 +12,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
@@ -23,15 +23,332 @@ jobs:
           gradle-version: '8.5'
           cache-disabled: true
 
-      - name: Find and Build Debug APK
+      - name: Auto-Fix Kotlin Syntax and Build APK
         run: |
-          if [ -f "build.gradle" ]; then
-            gradle assembleDebug
-          elif [ -f "S25_Subtitle_App/build.gradle" ]; then
-            cd S25_Subtitle_App && gradle assembleDebug
-          else
-            echo "Gradle config not found!" && exit 1
+          if [ -d "S25_Subtitle_App" ]; then
+            cd S25_Subtitle_App
           fi
+
+          # 1. 기존 MainActivity.kt에서 사용자 고유 채널 ID 자동 추출
+          CH_ID=$(grep -oP 's25_sub_[a-zA-Z0-9_]+' app/src/main/java/com/speed/s25subtitle/MainActivity.kt | head -n 1 || true)
+          if [ -z "$CH_ID" ]; then
+            CH_ID="s25_sub_default"
+          fi
+          echo "Detected Channel ID: $CH_ID"
+
+          # 2. AndroidManifest.xml (불필요한 특수권한 에러 제거 및 안정화)
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="S25 투명 자막기"
+                  android:supportsRtl="true"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".OverlayService"
+                      android:exported="false" />
+              </application>
+          </manifest>
+          EOF
+
+          # 3. app/build.gradle (안드로이드 14 호환 및 의존성 최소화)
+          cat << 'EOF' > app/build.gradle
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+
+          android {
+              namespace 'com.speed.s25subtitle'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.speed.s25subtitle"
+                  minSdk 26
+                  targetSdk 33
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              buildTypes {
+                  debug {
+                      minifyEnabled false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+
+          dependencies {
+          }
+          EOF
+
+          # 4. OverlayService.kt (컴파일 에러 원인이었던 readLine 루프 완벽 수정)
+          cat << 'EOF' > app/src/main/java/com/speed/s25subtitle/OverlayService.kt
+          package com.speed.s25subtitle
+
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.os.*
+          import android.view.*
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import org.json.JSONObject
+          import java.io.BufferedReader
+          import java.io.InputStreamReader
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import kotlin.math.abs
+
+          class OverlayService : Service() {
+              private lateinit var wm: WindowManager
+              private var subContainer: LinearLayout? = null
+              private var dragHandle: TextView? = null
+              private lateinit var srcView: OutlinedTextView
+              private lateinit var koView: OutlinedTextView
+              private lateinit var subParams: WindowManager.LayoutParams
+              private lateinit var handleParams: WindowManager.LayoutParams
+
+              @Volatile private var running = false
+              private val uiHandler = Handler(Looper.getMainLooper())
+              private var channelId = ""
+              private var delayMs = 0
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  channelId = intent?.getStringExtra("channel") ?: "s25_sub_default"
+                  val koSize = intent?.getFloatExtra("ko_size", 20f) ?: 20f
+                  delayMs = intent?.getIntExtra("delay_ms", 0) ?: 0
+
+                  startForegroundNotification()
+                  setupOverlayViews(koSize)
+                  startStreamReader()
+                  return START_STICKY
+              }
+
+              private fun startForegroundNotification() {
+                  val chId = "s25_overlay_channel"
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                      val ch = NotificationChannel(chId, "S25 자막 서비스", NotificationManager.IMPORTANCE_LOW)
+                      nm.createNotificationChannel(ch)
+                      val notif = Notification.Builder(this, chId)
+                          .setContentTitle("S25 투명 자막 작동 중")
+                          .setContentText("채널: $channelId")
+                          .setSmallIcon(android.R.drawable.ic_media_play)
+                          .build()
+                      startForeground(1001, notif)
+                  }
+              }
+
+              private fun setupOverlayViews(koSize: Float) {
+                  removeOverlays()
+                  wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  val dm = resources.displayMetrics
+
+                  subContainer = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setBackgroundColor(Color.TRANSPARENT)
+                      setPadding(24, 8, 24, 8)
+                  }
+
+                  srcView = OutlinedTextView(this).apply {
+                      text = "[$channelId] PC 자막 연결 완료"
+                      textSize = (koSize * 0.62f).coerceAtLeast(11f)
+                      setTextColor(Color.parseColor("#DDDDDD"))
+                      strokeWidthPx = 6f
+                      gravity = Gravity.CENTER
+                      setTypeface(null, Typeface.BOLD)
+                  }
+
+                  koView = OutlinedTextView(this).apply {
+                      text = "유튜브·트위치 앱을 켜고 편안하게 감상하세요!"
+                      textSize = koSize
+                      setTextColor(Color.parseColor("#00FF7F"))
+                      strokeWidthPx = 9f
+                      gravity = Gravity.CENTER
+                      setTypeface(null, Typeface.BOLD)
+                  }
+
+                  subContainer?.addView(srcView)
+                  subContainer?.addView(koView)
+
+                  subParams = WindowManager.LayoutParams(
+                      (dm.widthPixels * 0.92).toInt(),
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                              WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                              WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                      y = (dm.heightPixels * 0.76).toInt()
+                  }
+
+                  val pillBg = GradientDrawable().apply {
+                      setColor(Color.parseColor("#66000000"))
+                      cornerRadius = 40f
+                      setStroke(2, Color.parseColor("#8800FF7F"))
+                  }
+
+                  dragHandle = TextView(this).apply {
+                      text = "✥"
+                      textSize = 15f
+                      setTextColor(Color.parseColor("#00FF7F"))
+                      gravity = Gravity.CENTER
+                      background = pillBg
+                      setPadding(22, 12, 22, 12)
+                  }
+
+                  handleParams = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.END
+                      x = 16
+                      y = subParams.y
+                  }
+
+                  var initialY = 0
+                  var touchY = 0f
+                  var downTime = 0L
+
+                  dragHandle?.setOnTouchListener { _, ev ->
+                      when (ev.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              initialY = subParams.y
+                              touchY = ev.rawY
+                              downTime = System.currentTimeMillis()
+                              true
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dy = (ev.rawY - touchY).toInt()
+                              subParams.y = initialY + dy
+                              handleParams.y = initialY + dy
+                              try {
+                                  wm.updateViewLayout(subContainer, subParams)
+                                  wm.updateViewLayout(dragHandle, handleParams)
+                              } catch (_: Exception) {}
+                              true
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              if (System.currentTimeMillis() - downTime > 900 && abs(ev.rawY - touchY) < 25f) {
+                                  stopSelf()
+                              }
+                              true
+                          }
+                          else -> false
+                      }
+                  }
+
+                  wm.addView(subContainer, subParams)
+                  wm.addView(dragHandle, handleParams)
+              }
+
+              private fun startStreamReader() {
+                  running = false
+                  try { Thread.sleep(100) } catch (_: Exception) {}
+                  running = true
+
+                  Thread {
+                      while (running) {
+                          var conn: HttpURLConnection? = null
+                          try {
+                              val url = URL("https://ntfy.sh/$channelId/json")
+                              conn = (url.openConnection() as HttpURLConnection).apply {
+                                  connectTimeout = 5000
+                                  readTimeout = 65000
+                                  requestMethod = "GET"
+                              }
+                              val reader = BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8))
+                              while (running) {
+                                  val line = reader.readLine() ?: break
+                                  val raw = line.trim()
+                                  if (raw.isEmpty()) continue
+                                  val rootObj = JSONObject(raw)
+                                  if (rootObj.optString("event") == "message") {
+                                      val msgStr = rootObj.optString("message", "")
+                                      if (msgStr.startsWith("{")) {
+                                          val subObj = JSONObject(msgStr)
+                                          val lang = subObj.optString("lang", "EN")
+                                          val src = subObj.optString("src", "")
+                                          val ko = subObj.optString("ko", "")
+                                          val renderTask = Runnable {
+                                              srcView.text = "[$lang] $src"
+                                              koView.text = ko
+                                          }
+                                          if (delayMs > 0) {
+                                              uiHandler.postDelayed(renderTask, delayMs.toLong())
+                                          } else {
+                                              uiHandler.post(renderTask)
+                                          }
+                                      }
+                                  }
+                              }
+                          } catch (_: Exception) {
+                              try { Thread.sleep(1500) } catch (_: Exception) {}
+                          } finally {
+                              try { conn?.disconnect() } catch (_: Exception) {}
+                          }
+                      }
+                  }.apply {
+                      isDaemon = true
+                      start()
+                  }
+              }
+
+              private fun removeOverlays() {
+                  try {
+                      if (subContainer != null) wm.removeView(subContainer)
+                  } catch (_: Exception) {}
+                  try {
+                      if (dragHandle != null) wm.removeView(dragHandle)
+                  } catch (_: Exception) {}
+                  subContainer = null
+                  dragHandle = null
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  removeOverlays()
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+          gradle assembleDebug --no-daemon
 
       - name: Upload S25 APK
         uses: actions/upload-artifact@v4
