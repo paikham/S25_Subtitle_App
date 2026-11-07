@@ -23,20 +23,17 @@ jobs:
           gradle-version: '8.5'
           cache-disabled: true
 
-      - name: Auto-Fix Kotlin Syntax and Build APK
+      - name: Build Unlimited MQTT S25 APK
         run: |
           if [ -d "S25_Subtitle_App" ]; then
             cd S25_Subtitle_App
           fi
 
-          # 1. 기존 MainActivity.kt에서 사용자 고유 채널 ID 자동 추출
           CH_ID=$(grep -oP 's25_sub_[a-zA-Z0-9_]+' app/src/main/java/com/speed/s25subtitle/MainActivity.kt | head -n 1 || true)
           if [ -z "$CH_ID" ]; then
             CH_ID="s25_sub_default"
           fi
-          echo "Detected Channel ID: $CH_ID"
 
-          # 2. AndroidManifest.xml (불필요한 특수권한 에러 제거 및 안정화)
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -67,44 +64,6 @@ jobs:
           </manifest>
           EOF
 
-          # 3. app/build.gradle (안드로이드 14 호환 및 의존성 최소화)
-          cat << 'EOF' > app/build.gradle
-          plugins {
-              id 'com.android.application'
-              id 'org.jetbrains.kotlin.android'
-          }
-
-          android {
-              namespace 'com.speed.s25subtitle'
-              compileSdk 34
-
-              defaultConfig {
-                  applicationId "com.speed.s25subtitle"
-                  minSdk 26
-                  targetSdk 33
-                  versionCode 1
-                  versionName "1.0"
-              }
-
-              buildTypes {
-                  debug {
-                      minifyEnabled false
-                  }
-              }
-              compileOptions {
-                  sourceCompatibility JavaVersion.VERSION_17
-                  targetCompatibility JavaVersion.VERSION_17
-              }
-              kotlinOptions {
-                  jvmTarget = '17'
-              }
-          }
-
-          dependencies {
-          }
-          EOF
-
-          # 4. OverlayService.kt (컴파일 에러 원인이었던 readLine 루프 완벽 수정)
           cat << 'EOF' > app/src/main/java/com/speed/s25subtitle/OverlayService.kt
           package com.speed.s25subtitle
 
@@ -120,10 +79,12 @@ jobs:
           import android.widget.LinearLayout
           import android.widget.TextView
           import org.json.JSONObject
-          import java.io.BufferedReader
-          import java.io.InputStreamReader
-          import java.net.HttpURLConnection
-          import java.net.URL
+          import java.io.ByteArrayOutputStream
+          import java.io.EOFException
+          import java.io.InputStream
+          import java.net.InetSocketAddress
+          import java.net.Socket
+          import java.net.SocketTimeoutException
           import kotlin.math.abs
 
           class OverlayService : Service() {
@@ -139,6 +100,13 @@ jobs:
               private val uiHandler = Handler(Looper.getMainLooper())
               private var channelId = ""
               private var delayMs = 0
+              private var showSource = true
+
+              private val brokers = arrayOf(
+                  "broker.emqx.io",
+                  "broker.hivemq.com",
+                  "test.mosquitto.org"
+              )
 
               override fun onBind(intent: Intent?): IBinder? = null
 
@@ -149,7 +117,7 @@ jobs:
 
                   startForegroundNotification()
                   setupOverlayViews(koSize)
-                  startStreamReader()
+                  startUnlimitedMqttReader()
                   return START_STICKY
               }
 
@@ -157,11 +125,11 @@ jobs:
                   val chId = "s25_overlay_channel"
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                       val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                      val ch = NotificationChannel(chId, "S25 자막 서비스", NotificationManager.IMPORTANCE_LOW)
+                      val ch = NotificationChannel(chId, "S25 무제한 자막 서비스", NotificationManager.IMPORTANCE_LOW)
                       nm.createNotificationChannel(ch)
                       val notif = Notification.Builder(this, chId)
-                          .setContentTitle("S25 투명 자막 작동 중")
-                          .setContentText("채널: $channelId")
+                          .setContentTitle("S25 무제한 투명 자막 작동 중")
+                          .setContentText("채널: $channelId (일일 한도 무제한)")
                           .setSmallIcon(android.R.drawable.ic_media_play)
                           .build()
                       startForeground(1001, notif)
@@ -181,7 +149,7 @@ jobs:
                   }
 
                   srcView = OutlinedTextView(this).apply {
-                      text = "[$channelId] PC 자막 연결 완료"
+                      text = "[$channelId] 무제한 실시간 서버 연결 중..."
                       textSize = (koSize * 0.62f).coerceAtLeast(11f)
                       setTextColor(Color.parseColor("#DDDDDD"))
                       strokeWidthPx = 6f
@@ -264,8 +232,14 @@ jobs:
                               true
                           }
                           MotionEvent.ACTION_UP -> {
-                              if (System.currentTimeMillis() - downTime > 900 && abs(ev.rawY - touchY) < 25f) {
+                              val elapsed = System.currentTimeMillis() - downTime
+                              val moved = abs(ev.rawY - touchY)
+                              if (elapsed > 900 && moved < 25f) {
                                   stopSelf()
+                              } else if (elapsed < 300 && moved < 20f) {
+                                  // 짧게 1번 탭하면 원문 표시/숨김 즉시 토글
+                                  showSource = !showSource
+                                  srcView.visibility = if (showSource) View.VISIBLE else View.GONE
                               }
                               true
                           }
@@ -277,50 +251,145 @@ jobs:
                   wm.addView(dragHandle, handleParams)
               }
 
-              private fun startStreamReader() {
+              private fun encodeVarLen(len: Int): ByteArray {
+                  var l = len
+                  val out = ByteArrayOutputStream()
+                  do {
+                      var b = l % 128
+                      l /= 128
+                      if (l > 0) b = b or 0x80
+                      out.write(b)
+                  } while (l > 0)
+                  return out.toByteArray()
+              }
+
+              private fun buildConnectPacket(clientId: String): ByteArray {
+                  val cid = clientId.toByteArray(Charsets.UTF_8)
+                  val body = ByteArrayOutputStream()
+                  body.write(byteArrayOf(0x00, 0x04, 'M'.code.toByte(), 'Q'.code.toByte(), 'T'.code.toByte(), 'T'.code.toByte(), 0x04, 0x02, 0x00, 0x3c))
+                  body.write((cid.size shr 8) and 0xFF)
+                  body.write(cid.size and 0xFF)
+                  body.write(cid)
+                  val bArr = body.toByteArray()
+                  val pkt = ByteArrayOutputStream()
+                  pkt.write(0x10)
+                  pkt.write(encodeVarLen(bArr.size))
+                  pkt.write(bArr)
+                  return pkt.toByteArray()
+              }
+
+              private fun buildSubscribePacket(topic: String): ByteArray {
+                  val tBytes = topic.toByteArray(Charsets.UTF_8)
+                  val body = ByteArrayOutputStream()
+                  body.write(byteArrayOf(0x00, 0x01))
+                  body.write((tBytes.size shr 8) and 0xFF)
+                  body.write(tBytes.size and 0xFF)
+                  body.write(tBytes)
+                  body.write(0x00)
+                  val bArr = body.toByteArray()
+                  val pkt = ByteArrayOutputStream()
+                  pkt.write(0x82)
+                  pkt.write(encodeVarLen(bArr.size))
+                  pkt.write(bArr)
+                  return pkt.toByteArray()
+              }
+
+              private fun readExact(input: InputStream, buf: ByteArray) {
+                  var total = 0
+                  while (total < buf.size) {
+                      val r = input.read(buf, total, buf.size - total)
+                      if (r == -1) throw EOFException()
+                      total += r
+                  }
+              }
+
+              private fun startUnlimitedMqttReader() {
                   running = false
                   try { Thread.sleep(100) } catch (_: Exception) {}
                   running = true
 
                   Thread {
+                      var bIdx = 0
                       while (running) {
-                          var conn: HttpURLConnection? = null
+                          var sock: Socket? = null
                           try {
-                              val url = URL("https://ntfy.sh/$channelId/json")
-                              conn = (url.openConnection() as HttpURLConnection).apply {
-                                  connectTimeout = 5000
-                                  readTimeout = 65000
-                                  requestMethod = "GET"
+                              val host = brokers[bIdx % brokers.size]
+                              sock = Socket()
+                              sock.connect(InetSocketAddress(host, 1883), 4500)
+                              sock.soTimeout = 25000
+
+                              val out = sock.getOutputStream()
+                              val input = sock.getInputStream()
+
+                              val cid = "s25_${channelId}_${System.currentTimeMillis() % 100000}"
+                              out.write(buildConnectPacket(cid))
+                              out.flush()
+
+                              val connAck = ByteArray(4)
+                              readExact(input, connAck)
+
+                              val topic = "s25_live_sub/$channelId"
+                              out.write(buildSubscribePacket(topic))
+                              out.flush()
+
+                              uiHandler.post {
+                                  srcView.text = "[$channelId] 🟢 무제한 실시간 서버 연결 완료!"
                               }
-                              val reader = BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8))
+
                               while (running) {
-                                  val line = reader.readLine() ?: break
-                                  val raw = line.trim()
-                                  if (raw.isEmpty()) continue
-                                  val rootObj = JSONObject(raw)
-                                  if (rootObj.optString("event") == "message") {
-                                      val msgStr = rootObj.optString("message", "")
-                                      if (msgStr.startsWith("{")) {
-                                          val subObj = JSONObject(msgStr)
-                                          val lang = subObj.optString("lang", "EN")
-                                          val src = subObj.optString("src", "")
-                                          val ko = subObj.optString("ko", "")
-                                          val renderTask = Runnable {
-                                              srcView.text = "[$lang] $src"
-                                              koView.text = ko
-                                          }
-                                          if (delayMs > 0) {
-                                              uiHandler.postDelayed(renderTask, delayMs.toLong())
-                                          } else {
-                                              uiHandler.post(renderTask)
+                                  try {
+                                      val header = input.read()
+                                      if (header == -1) throw EOFException()
+
+                                      var multiplier = 1
+                                      var remLen = 0
+                                      while (true) {
+                                          val eb = input.read()
+                                          if (eb == -1) throw EOFException()
+                                          remLen += (eb and 127) * multiplier
+                                          if ((eb and 128) == 0) break
+                                          multiplier *= 128
+                                      }
+
+                                      val payloadBuf = ByteArray(remLen)
+                                      if (remLen > 0) {
+                                          readExact(input, payloadBuf)
+                                      }
+
+                                      val pktType = (header shr 4) and 0x0F
+                                      if (pktType == 3 && remLen > 2) {
+                                          val tLen = ((payloadBuf[0].toInt() and 0xFF) shl 8) or (payloadBuf[1].toInt() and 0xFF)
+                                          val qos = (header shr 1) and 0x03
+                                          val offset = 2 + tLen + if (qos > 0) 2 else 0
+                                          if (offset < remLen) {
+                                              val msgStr = String(payloadBuf, offset, remLen - offset, Charsets.UTF_8).trim()
+                                              if (msgStr.startsWith("{")) {
+                                                  val subObj = JSONObject(msgStr)
+                                                  val lang = subObj.optString("lang", "EN")
+                                                  val src = subObj.optString("src", "")
+                                                  val ko = subObj.optString("ko", "")
+                                                  val task = Runnable {
+                                                      srcView.text = "[$lang] $src"
+                                                      koView.text = ko
+                                                  }
+                                                  if (delayMs > 0) {
+                                                      uiHandler.postDelayed(task, delayMs.toLong())
+                                                  } else {
+                                                      uiHandler.post(task)
+                                                  }
+                                              }
                                           }
                                       }
+                                  } catch (_: SocketTimeoutException) {
+                                      out.write(byteArrayOf(0xC0.toByte(), 0x00.toByte()))
+                                      out.flush()
                                   }
                               }
                           } catch (_: Exception) {
+                              bIdx++
                               try { Thread.sleep(1500) } catch (_: Exception) {}
                           } finally {
-                              try { conn?.disconnect() } catch (_: Exception) {}
+                              try { sock?.close() } catch (_: Exception) {}
                           }
                       }
                   }.apply {
