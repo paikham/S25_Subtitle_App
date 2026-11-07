@@ -28,7 +28,7 @@ jobs:
           gradle-version: '8.5'
           cache-disabled: true
 
-      - name: Build Fixed S25 APK
+      - name: Build S25 APK v3.1 (500s Sync Gauge + Decimal Input)
         run: |
           if [ -d "S25_Subtitle_App" ]; then
             cd S25_Subtitle_App
@@ -48,8 +48,8 @@ jobs:
                   applicationId "com.speed.s25subtitle"
                   minSdk 26
                   targetSdk 33
-                  versionCode 3
-                  versionName "3.0"
+                  versionCode 4
+                  versionName "3.1"
               }
 
               buildTypes {
@@ -88,7 +88,8 @@ jobs:
 
                   <activity
                       android:name=".MainActivity"
-                      android:exported="true">
+                      android:exported="true"
+                      android:windowSoftInputMode="stateHidden|adjustResize">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
@@ -115,11 +116,18 @@ jobs:
           import android.os.Bundle
           import android.os.PowerManager
           import android.provider.Settings
+          import android.text.Editable
+          import android.text.InputType
+          import android.text.TextWatcher
+          import android.view.Gravity
           import android.widget.*
+          import java.util.Locale
+          import kotlin.math.roundToInt
 
           class MainActivity : Activity() {
               private lateinit var battBtn: Button
               private val defaultChannel = "s25_paikham_live"
+              private var isSyncingUi = false
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
@@ -130,7 +138,7 @@ jobs:
                       savedChannel = defaultChannel
                   }
                   val savedSize = prefs.getFloat("ko_size", 20f)
-                  val savedDelay = prefs.getInt("delay_ms", 0)
+                  val savedDelayMs = prefs.getInt("delay_ms", 0).coerceIn(0, 500000)
 
                   val scroll = ScrollView(this).apply {
                       setBackgroundColor(Color.parseColor("#0D0D0D"))
@@ -138,12 +146,12 @@ jobs:
 
                   val root = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
-                      setPadding(52, 64, 52, 64)
+                      setPadding(52, 60, 52, 60)
                   }
                   scroll.addView(root)
 
                   val title = TextView(this).apply {
-                      text = "📱 갤럭시 S25 투명 자막기 v3.0"
+                      text = "📱 갤럭시 S25 투명 자막기 v3.1"
                       textSize = 21f
                       setTextColor(Color.parseColor("#00FF7F"))
                       setTypeface(null, Typeface.BOLD)
@@ -151,30 +159,28 @@ jobs:
                   root.addView(title)
 
                   val desc = TextView(this).apply {
-                      text = "PC와 채널 ID(s25_paikham_live)가 영구 통일되어 바로 연결됩니다."
+                      text = "• 최대 500초 싱크 지연 (소수점 입력 & 게이지바 연동)\n• 방송 중 우측 [✥] 버튼 더블탭으로 즉시 싱크 조절 가능"
                       textSize = 13f
                       setTextColor(Color.parseColor("#AAAAAA"))
-                      setPadding(0, 12, 0, 28)
+                      setPadding(0, 12, 0, 24)
                   }
                   root.addView(desc)
 
                   battBtn = Button(this).apply {
                       textSize = 13f
                       setTypeface(null, Typeface.BOLD)
-                      setPadding(0, 24, 0, 24)
-                      setOnClickListener {
-                          requestIgnoreBattery()
-                      }
+                      setPadding(0, 22, 0, 22)
+                      setOnClickListener { requestIgnoreBattery() }
                   }
                   val lpBatt = LinearLayout.LayoutParams(
                       LinearLayout.LayoutParams.MATCH_PARENT,
                       LinearLayout.LayoutParams.WRAP_CONTENT
-                  ).apply { bottomMargin = 28 }
+                  ).apply { bottomMargin = 24 }
                   root.addView(battBtn, lpBatt)
                   updateBatteryButtonState()
 
                   val chLabel = TextView(this).apply {
-                      text = "🔑 PC 직통 채널 ID (자동 통일됨)"
+                      text = "🔑 PC 직통 채널 ID"
                       textSize = 14f
                       setTextColor(Color.parseColor("#FFE600"))
                       setTypeface(null, Typeface.BOLD)
@@ -183,10 +189,10 @@ jobs:
 
                   val chInput = EditText(this).apply {
                       setText(savedChannel)
-                      textSize = 17f
+                      textSize = 16f
                       setTextColor(Color.WHITE)
                       setBackgroundColor(Color.parseColor("#1E1E1E"))
-                      setPadding(32, 24, 32, 24)
+                      setPadding(28, 20, 28, 20)
                   }
                   root.addView(chInput)
 
@@ -194,7 +200,7 @@ jobs:
                       text = "📏 한국어 자막 크기: ${savedSize.toInt()}sp"
                       textSize = 14f
                       setTextColor(Color.WHITE)
-                      setPadding(0, 32, 0, 10)
+                      setPadding(0, 28, 0, 8)
                   }
                   root.addView(sizeLabel)
 
@@ -204,6 +210,7 @@ jobs:
                       setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                           override fun onProgressChanged(s: SeekBar?, p: Int, f: Boolean) {
                               sizeLabel.text = "📏 한국어 자막 크기: ${14 + p}sp"
+                              prefs.edit().putFloat("ko_size", (14 + p).toFloat()).apply()
                           }
                           override fun onStartTrackingTouch(s: SeekBar?) {}
                           override fun onStopTrackingTouch(s: SeekBar?) {}
@@ -211,30 +218,128 @@ jobs:
                   }
                   root.addView(sizeSeek)
 
-                  val delayLabel = TextView(this).apply {
-                      text = "⏱️ 폰-PC 영상 싱크 지연: ${savedDelay / 1000.0}초"
+                  // ================= 0.0 ~ 500.0초 싱크 지연 (게이지바 + 소수점 입력칸) =================
+                  val delayTitle = TextView(this).apply {
+                      text = "⏱️ 폰-PC 스트리밍 싱크 지연 (0.0 ~ 500.0초)"
+                      textSize = 14f
+                      setTextColor(Color.parseColor("#00E5FF"))
+                      setTypeface(null, Typeface.BOLD)
+                      setPadding(0, 32, 0, 10)
+                  }
+                  root.addView(delayTitle)
+
+                  val inputRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+
+                  val delayInput = EditText(this).apply {
+                      inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+                      setText(String.format(Locale.US, "%.1f", savedDelayMs / 1000.0))
+                      textSize = 17f
+                      setTextColor(Color.parseColor("#00FF7F"))
+                      setTypeface(null, Typeface.BOLD)
+                      setBackgroundColor(Color.parseColor("#1E1E1E"))
+                      gravity = Gravity.CENTER
+                      setPadding(24, 18, 24, 18)
+                      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.2f)
+                  }
+                  inputRow.addView(delayInput)
+
+                  val unitLbl = TextView(this).apply {
+                      text = " 초(s) "
                       textSize = 14f
                       setTextColor(Color.WHITE)
-                      setPadding(0, 24, 0, 10)
+                      setPadding(8, 0, 12, 0)
                   }
-                  root.addView(delayLabel)
+                  inputRow.addView(unitLbl)
 
                   val delaySeek = SeekBar(this).apply {
-                      max = 50
-                      progress = (savedDelay / 100).coerceIn(0, 50)
-                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                          override fun onProgressChanged(s: SeekBar?, p: Int, f: Boolean) {
-                              delayLabel.text = "⏱️ 폰-PC 영상 싱크 지연: ${p / 10.0}초"
-                          }
-                          override fun onStartTrackingTouch(s: SeekBar?) {}
-                          override fun onStopTrackingTouch(s: SeekBar?) {}
-                      })
+                      max = 5000 // 0.0s ~ 500.0s (0.1초 단위 5000단계)
+                      progress = (savedDelayMs / 100).coerceIn(0, 5000)
                   }
-                  root.addView(delaySeek)
+
+                  fun applyDelayMs(newMs: Int, updateEdit: Boolean, updateSeek: Boolean) {
+                      val clampedMs = newMs.coerceIn(0, 500000)
+                      prefs.edit().putInt("delay_ms", clampedMs).apply()
+                      isSyncingUi = true
+                      if (updateSeek) {
+                          delaySeek.progress = (clampedMs / 100.0).roundToInt().coerceIn(0, 5000)
+                      }
+                      if (updateEdit) {
+                          val sec = clampedMs / 1000.0
+                          val formatted = if (clampedMs % 100 == 0) {
+                              String.format(Locale.US, "%.1f", sec)
+                          } else {
+                              String.format(Locale.US, "%.2f", sec)
+                          }
+                          delayInput.setText(formatted)
+                          delayInput.setSelection(delayInput.text.length)
+                      }
+                      isSyncingUi = false
+                  }
+
+                  fun makeStepBtn(label: String, deltaMs: Int): Button {
+                      return Button(this).apply {
+                          text = label
+                          textSize = 12f
+                          setTextColor(Color.WHITE)
+                          setBackgroundColor(Color.parseColor("#2A2A2A"))
+                          setPadding(12, 14, 12, 14)
+                          layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.75f).apply {
+                              marginStart = 6
+                          }
+                          setOnClickListener {
+                              val curMs = prefs.getInt("delay_ms", 0)
+                              applyDelayMs(curMs + deltaMs, updateEdit = true, updateSeek = true)
+                          }
+                      }
+                  }
+
+                  inputRow.addView(makeStepBtn("-1.0", -1000))
+                  inputRow.addView(makeStepBtn("-0.1", -100))
+                  inputRow.addView(makeStepBtn("+0.1", 100))
+                  inputRow.addView(makeStepBtn("+1.0", 1000))
+                  root.addView(inputRow)
+
+                  delaySeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                          if (fromUser && !isSyncingUi) {
+                              applyDelayMs(p * 100, updateEdit = true, updateSeek = false)
+                          }
+                      }
+                      override fun onStartTrackingTouch(s: SeekBar?) {}
+                      override fun onStopTrackingTouch(s: SeekBar?) {}
+                  })
+                  val lpSeek = LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT,
+                      LinearLayout.LayoutParams.WRAP_CONTENT
+                  ).apply { topMargin = 18 }
+                  root.addView(delaySeek, lpSeek)
+
+                  delayInput.addTextChangedListener(object : TextWatcher {
+                      override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                      override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                      override fun afterTextChanged(s: Editable?) {
+                          if (isSyncingUi) return
+                          val raw = s?.toString()?.trim() ?: ""
+                          if (raw.isEmpty() || raw == ".") {
+                              prefs.edit().putInt("delay_ms", 0).apply()
+                              isSyncingUi = true
+                              delaySeek.progress = 0
+                              isSyncingUi = false
+                              return
+                          }
+                          val parsedSec = raw.toDoubleOrNull() ?: return
+                          val clampedSec = parsedSec.coerceIn(0.0, 500.0)
+                          val ms = (clampedSec * 1000.0).roundToInt()
+                          applyDelayMs(ms, updateEdit = false, updateSeek = true)
+                      }
+                  })
 
                   val startBtn = Button(this).apply {
-                      text = "🚀 투명 자막 오버레이 시작"
-                      textSize = 16f
+                      text = "🚀 투명 자막 오버레이 시작 / 설정 즉시 반영"
+                      textSize = 15f
                       setTextColor(Color.BLACK)
                       setBackgroundColor(Color.parseColor("#00FF7F"))
                       setTypeface(null, Typeface.BOLD)
@@ -248,13 +353,13 @@ jobs:
 
                           val ch = chInput.text.toString().trim().ifEmpty { defaultChannel }
                           val sz = (14 + sizeSeek.progress).toFloat()
-                          val dl = delaySeek.progress * 100
-                          prefs.edit().putString("channel", ch).putFloat("ko_size", sz).putInt("delay_ms", dl).apply()
+                          val curDelayMs = prefs.getInt("delay_ms", 0).coerceIn(0, 500000)
+                          prefs.edit().putString("channel", ch).putFloat("ko_size", sz).putInt("delay_ms", curDelayMs).apply()
 
                           val svc = Intent(this@MainActivity, OverlayService::class.java).apply {
                               putExtra("channel", ch)
                               putExtra("ko_size", sz)
-                              putExtra("delay_ms", dl)
+                              putExtra("delay_ms", curDelayMs)
                           }
                           try {
                               if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -265,14 +370,14 @@ jobs:
                           } catch (_: Exception) {
                               try { startService(svc) } catch (_: Exception) {}
                           }
-                          Toast.makeText(this@MainActivity, "투명 자막이 켜졌습니다!", Toast.LENGTH_SHORT).show()
+                          Toast.makeText(this@MainActivity, "투명 자막이 켜졌습니다! (싱크 지연: ${curDelayMs / 1000.0}초)", Toast.LENGTH_SHORT).show()
                           moveTaskToBack(true)
                       }
                   }
                   val lpStart = LinearLayout.LayoutParams(
                       LinearLayout.LayoutParams.MATCH_PARENT,
                       LinearLayout.LayoutParams.WRAP_CONTENT
-                  ).apply { topMargin = 44 }
+                  ).apply { topMargin = 40 }
                   root.addView(startBtn, lpStart)
 
                   val stopBtn = Button(this).apply {
@@ -337,14 +442,17 @@ jobs:
           import android.app.*
           import android.content.Context
           import android.content.Intent
+          import android.content.SharedPreferences
           import android.graphics.Color
           import android.graphics.PixelFormat
           import android.graphics.Typeface
           import android.graphics.drawable.GradientDrawable
           import android.os.*
+          import android.text.Editable
+          import android.text.InputType
+          import android.text.TextWatcher
           import android.view.*
-          import android.widget.LinearLayout
-          import android.widget.TextView
+          import android.widget.*
           import org.json.JSONObject
           import java.io.ByteArrayOutputStream
           import java.io.EOFException
@@ -352,13 +460,26 @@ jobs:
           import java.net.InetSocketAddress
           import java.net.Socket
           import java.net.SocketTimeoutException
+          import java.util.Locale
+          import java.util.concurrent.CopyOnWriteArrayList
           import java.util.concurrent.atomic.AtomicInteger
           import kotlin.math.abs
+          import kotlin.math.roundToInt
 
           class OverlayService : Service() {
+              data class SubEntry(
+                  val id: Long,
+                  val arrivalMs: Long,
+                  val lang: String,
+                  val src: String,
+                  val ko: String
+              )
+
               private lateinit var wm: WindowManager
+              private lateinit var prefs: SharedPreferences
               private var subContainer: LinearLayout? = null
               private var dragHandle: TextView? = null
+              private var syncPanel: LinearLayout? = null
               private lateinit var srcView: OutlinedTextView
               private lateinit var koView: OutlinedTextView
               private lateinit var subParams: WindowManager.LayoutParams
@@ -368,8 +489,14 @@ jobs:
               private val sessionGen = AtomicInteger(0)
               private val uiHandler = Handler(Looper.getMainLooper())
               private var channelId = "s25_paikham_live"
-              private var delayMs = 0
+              @Volatile private var delayMs = 0
               private var showSource = true
+
+              // 최근 520초 분량의 자막을 보관하는 타임시프트 버퍼
+              private val subHistory = CopyOnWriteArrayList<SubEntry>()
+              private var seqCounter = 0L
+              private var lastRenderedId = -1L
+              private var lastTapTime = 0L
 
               private val brokers = arrayOf(
                   "broker.emqx.io",
@@ -377,19 +504,77 @@ jobs:
                   "test.mosquitto.org"
               )
 
+              private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { sp, key ->
+                  if (key == "delay_ms") {
+                      delayMs = sp.getInt("delay_ms", 0).coerceIn(0, 500000)
+                      uiHandler.post { renderTimeShiftedSubtitle() }
+                  } else if (key == "ko_size") {
+                      val sz = sp.getFloat("ko_size", 20f)
+                      uiHandler.post {
+                          if (::srcView.isInitialized && ::koView.isInitialized) {
+                              srcView.textSize = (sz * 0.62f).coerceAtLeast(11f)
+                              koView.textSize = sz
+                          }
+                      }
+                  }
+              }
+
+              private val tickerRunnable = object : Runnable {
+                  override fun run() {
+                      renderTimeShiftedSubtitle()
+                      uiHandler.postDelayed(this, 80L)
+                  }
+              }
+
               override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  prefs = getSharedPreferences("s25_sub_prefs", Context.MODE_PRIVATE)
+                  prefs.registerOnSharedPreferenceChangeListener(prefListener)
+              }
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
                   val inCh = intent?.getStringExtra("channel")?.trim()
                   channelId = if (inCh.isNullOrEmpty() || inCh == "s25_sub_default") "s25_paikham_live" else inCh
-                  val koSize = intent?.getFloatExtra("ko_size", 20f) ?: 20f
-                  delayMs = intent?.getIntExtra("delay_ms", 0) ?: 0
+                  val koSize = intent?.getFloatExtra("ko_size", prefs.getFloat("ko_size", 20f)) ?: 20f
+                  delayMs = (intent?.getIntExtra("delay_ms", prefs.getInt("delay_ms", 0)) ?: 0).coerceIn(0, 500000)
 
                   acquireWakeLock()
                   startForegroundSafe()
                   setupOverlayViews(koSize)
+                  uiHandler.removeCallbacks(tickerRunnable)
+                  uiHandler.post(tickerRunnable)
                   startUnlimitedMqttReader()
                   return START_STICKY
+              }
+
+              private fun renderTimeShiftedSubtitle() {
+                  if (subHistory.isEmpty() || !::srcView.isInitialized || !::koView.isInitialized) return
+                  val now = SystemClock.elapsedRealtime()
+                  val targetTime = now - delayMs
+
+                  var candidate: SubEntry? = null
+                  for (entry in subHistory) {
+                      if (entry.arrivalMs <= targetTime) {
+                          candidate = entry
+                      } else {
+                          break
+                      }
+                  }
+
+                  if (candidate != null && candidate.id != lastRenderedId) {
+                      lastRenderedId = candidate.id
+                      val delayBadge = if (delayMs > 0) String.format(Locale.US, " -%.1fs", delayMs / 1000.0) else ""
+                      srcView.text = "[${candidate.lang}$delayBadge] ${candidate.src}"
+                      koView.text = candidate.ko
+                  }
+
+                  // 520초(520,000ms) 지난 오래된 자막 메모리 정리
+                  val cutoff = now - 520000L
+                  while (subHistory.isNotEmpty() && subHistory[0].arrivalMs < cutoff) {
+                      subHistory.removeAt(0)
+                  }
               }
 
               private fun acquireWakeLock() {
@@ -413,12 +598,155 @@ jobs:
                           nm.createNotificationChannel(ch)
                           val notif = Notification.Builder(this, chId)
                               .setContentTitle("S25 투명 자막 작동 중")
-                              .setContentText("채널: $channelId")
+                              .setContentText("채널: $channelId (✥ 더블탭: 싱크 조절)")
                               .setSmallIcon(android.R.drawable.ic_media_play)
                               .build()
                           startForeground(1001, notif)
                       }
                   } catch (_: Exception) {}
+              }
+
+              private fun toggleSyncPopup() {
+                  if (syncPanel != null) {
+                      try { wm.removeView(syncPanel) } catch (_: Exception) {}
+                      syncPanel = null
+                      return
+                  }
+
+                  val dm = resources.displayMetrics
+                  val boxBg = GradientDrawable().apply {
+                      setColor(Color.parseColor("#EE121212"))
+                      cornerRadius = 28f
+                      setStroke(3, Color.parseColor("#00FF7F"))
+                  }
+
+                  val panel = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      background = boxBg
+                      setPadding(36, 28, 36, 28)
+                  }
+
+                  val topRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+
+                  val title = TextView(this).apply {
+                      text = "⏱️ 실시간 싱크 지연 (0~500초)"
+                      textSize = 13f
+                      setTextColor(Color.parseColor("#00FF7F"))
+                      setTypeface(null, Typeface.BOLD)
+                      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                  }
+                  topRow.addView(title)
+
+                  val closeBtn = TextView(this).apply {
+                      text = "✕ 닫기"
+                      textSize = 13f
+                      setTextColor(Color.parseColor("#FF8888"))
+                      setTypeface(null, Typeface.BOLD)
+                      setPadding(20, 6, 8, 6)
+                      setOnClickListener { toggleSyncPopup() }
+                  }
+                  topRow.addView(closeBtn)
+                  panel.addView(topRow)
+
+                  var syncingPopup = false
+                  val ctrlRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(0, 14, 0, 10)
+                  }
+
+                  val edit = EditText(this).apply {
+                      inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+                      setText(String.format(Locale.US, "%.1f", delayMs / 1000.0))
+                      textSize = 15f
+                      setTextColor(Color.parseColor("#FFE600"))
+                      setTypeface(null, Typeface.BOLD)
+                      setBackgroundColor(Color.parseColor("#222222"))
+                      gravity = Gravity.CENTER
+                      setPadding(16, 12, 16, 12)
+                      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.1f)
+                  }
+                  ctrlRow.addView(edit)
+
+                  val seek = SeekBar(this).apply {
+                      max = 5000
+                      progress = (delayMs / 100).coerceIn(0, 5000)
+                  }
+
+                  fun updatePopupDelay(newMs: Int, upEdit: Boolean, upSeek: Boolean) {
+                      val clamped = newMs.coerceIn(0, 500000)
+                      delayMs = clamped
+                      prefs.edit().putInt("delay_ms", clamped).apply()
+                      syncingPopup = true
+                      if (upSeek) seek.progress = (clamped / 100.0).roundToInt().coerceIn(0, 5000)
+                      if (upEdit) {
+                          edit.setText(String.format(Locale.US, "%.1f", clamped / 1000.0))
+                          edit.setSelection(edit.text.length)
+                      }
+                      syncingPopup = false
+                      renderTimeShiftedSubtitle()
+                  }
+
+                  fun stepBtn(txt: String, dMs: Int): Button {
+                      return Button(this).apply {
+                          text = txt
+                          textSize = 11f
+                          setTextColor(Color.WHITE)
+                          setBackgroundColor(Color.parseColor("#2E2E2E"))
+                          setPadding(6, 8, 6, 8)
+                          layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.7f).apply {
+                              marginStart = 6
+                          }
+                          setOnClickListener { updatePopupDelay(delayMs + dMs, upEdit = true, upSeek = true) }
+                      }
+                  }
+
+                  ctrlRow.addView(stepBtn("-1.0", -1000))
+                  ctrlRow.addView(stepBtn("-0.1", -100))
+                  ctrlRow.addView(stepBtn("+0.1", 100))
+                  ctrlRow.addView(stepBtn("+1.0", 1000))
+                  panel.addView(ctrlRow)
+
+                  seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                          if (fromUser && !syncingPopup) {
+                              updatePopupDelay(p * 100, upEdit = true, upSeek = false)
+                          }
+                      }
+                      override fun onStartTrackingTouch(s: SeekBar?) {}
+                      override fun onStopTrackingTouch(s: SeekBar?) {}
+                  })
+                  panel.addView(seek)
+
+                  edit.addTextChangedListener(object : TextWatcher {
+                      override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                      override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                      override fun afterTextChanged(s: Editable?) {
+                          if (syncingPopup) return
+                          val raw = s?.toString()?.trim() ?: ""
+                          val sec = raw.toDoubleOrNull() ?: 0.0
+                          val ms = (sec.coerceIn(0.0, 500.0) * 1000.0).roundToInt()
+                          updatePopupDelay(ms, upEdit = false, upSeek = true)
+                      }
+                  })
+
+                  val popupParams = WindowManager.LayoutParams(
+                      (dm.widthPixels * 0.88).toInt(),
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                              WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                      y = (subParams.y - 260).coerceAtLeast(80)
+                  }
+
+                  syncPanel = panel
+                  try { wm.addView(syncPanel, popupParams) } catch (_: Exception) {}
               }
 
               private fun setupOverlayViews(koSize: Float) {
@@ -443,7 +771,7 @@ jobs:
                   }
 
                   koView = OutlinedTextView(this).apply {
-                      text = "유튜브·트위치 앱을 켜고 편안하게 감상하세요!"
+                      text = "유튜브·트위치 앱을 켜고 감상하세요! (✥ 더블탭: 싱크 조절)"
                       textSize = koSize
                       setTextColor(Color.parseColor("#00FF7F"))
                       strokeWidthPx = 9f
@@ -518,13 +846,25 @@ jobs:
                               true
                           }
                           MotionEvent.ACTION_UP -> {
-                              val elapsed = System.currentTimeMillis() - downTime
+                              val now = System.currentTimeMillis()
+                              val elapsed = now - downTime
                               val moved = abs(ev.rawY - touchY)
                               if (elapsed > 900 && moved < 25f) {
                                   stopSelf()
                               } else if (elapsed < 300 && moved < 20f) {
-                                  showSource = !showSource
-                                  srcView.visibility = if (showSource) View.VISIBLE else View.GONE
+                                  if (now - lastTapTime < 350L) {
+                                      // 더블탭: 미니 싱크 조절창 열기/닫기
+                                      toggleSyncPopup()
+                                      lastTapTime = 0L
+                                  } else {
+                                      lastTapTime = now
+                                      uiHandler.postDelayed({
+                                          if (System.currentTimeMillis() - lastTapTime >= 340L && lastTapTime != 0L) {
+                                              showSource = !showSource
+                                              srcView.visibility = if (showSource) View.VISIBLE else View.GONE
+                                          }
+                                      }, 350L)
+                                  }
                               }
                               true
                           }
@@ -620,7 +960,7 @@ jobs:
                               out.flush()
 
                               uiHandler.post {
-                                  if (sessionGen.get() == myGen) {
+                                  if (sessionGen.get() == myGen && subHistory.isEmpty()) {
                                       srcView.text = "[$channelId] 🟢 실시간 연결 완료 ($host)"
                                   }
                               }
@@ -660,23 +1000,21 @@ jobs:
                                                   val lang = subObj.optString("lang", "EN")
                                                   val src = subObj.optString("src", "")
                                                   val ko = subObj.optString("ko", "")
-                                                  val task = Runnable {
-                                                      if (sessionGen.get() == myGen) {
-                                                          srcView.text = "[$lang] $src"
-                                                          koView.text = ko
-                                                      }
-                                                  }
-                                                  if (delayMs > 0) {
-                                                      uiHandler.postDelayed(task, delayMs.toLong())
-                                                  } else {
-                                                      uiHandler.post(task)
-                                                  }
+                                                  val entry = SubEntry(
+                                                      id = ++seqCounter,
+                                                      arrivalMs = SystemClock.elapsedRealtime(),
+                                                      lang = lang,
+                                                      src = src,
+                                                      ko = ko
+                                                  )
+                                                  subHistory.add(entry)
+                                                  uiHandler.post { renderTimeShiftedSubtitle() }
                                               }
                                           }
                                       }
                                   } catch (_: SocketTimeoutException) {
                                       if (awaitingPingResp) {
-                                          throw EOFException("Ping timeout - reconnecting")
+                                          throw EOFException("Ping timeout")
                                       }
                                       awaitingPingResp = true
                                       out.write(byteArrayOf(0xC0.toByte(), 0x00.toByte()))
@@ -698,17 +1036,23 @@ jobs:
 
               private fun removeOverlays() {
                   try {
+                      if (syncPanel != null) wm.removeView(syncPanel)
+                  } catch (_: Exception) {}
+                  try {
                       if (subContainer != null) wm.removeView(subContainer)
                   } catch (_: Exception) {}
                   try {
                       if (dragHandle != null) wm.removeView(dragHandle)
                   } catch (_: Exception) {}
+                  syncPanel = null
                   subContainer = null
                   dragHandle = null
               }
 
               override fun onDestroy() {
                   sessionGen.incrementAndGet()
+                  uiHandler.removeCallbacks(tickerRunnable)
+                  try { prefs.unregisterOnSharedPreferenceChangeListener(prefListener) } catch (_: Exception) {}
                   try {
                       if (wakeLock?.isHeld == true) wakeLock?.release()
                   } catch (_: Exception) {}
@@ -729,7 +1073,7 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add S25_Subtitle_Overlay.apk
-            git commit -m "Publish v3.0 APK" || true
+            git commit -m "Publish v3.1 APK with 500s sync slider and decimal input" || true
             git push origin HEAD:main || true
           fi
 
