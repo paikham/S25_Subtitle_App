@@ -28,18 +28,12 @@ jobs:
           gradle-version: '8.5'
           cache-disabled: true
 
-      - name: Build Anti-Sleep Unlimited S25 APK
+      - name: Build Fixed S25 APK
         run: |
           if [ -d "S25_Subtitle_App" ]; then
             cd S25_Subtitle_App
           fi
 
-          CH_ID=$(grep -oP 's25_sub_[a-zA-Z0-9_]+' app/src/main/java/com/speed/s25subtitle/MainActivity.kt | head -n 1 || true)
-          if [ -z "$CH_ID" ]; then
-            CH_ID="s25_sub_default"
-          fi
-
-          # 1. app/build.gradle (targetSdk 33 고정으로 안드로이드 15 강제종료 원천 차단)
           cat << 'EOF' > app/build.gradle
           plugins {
               id 'com.android.application'
@@ -54,8 +48,8 @@ jobs:
                   applicationId "com.speed.s25subtitle"
                   minSdk 26
                   targetSdk 33
-                  versionCode 2
-                  versionName "2.0"
+                  versionCode 3
+                  versionName "3.0"
               }
 
               buildTypes {
@@ -76,7 +70,6 @@ jobs:
           }
           EOF
 
-          # 2. AndroidManifest.xml (배터리 최적화 제외 및 WakeLock 권한 추가)
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -109,8 +102,7 @@ jobs:
           </manifest>
           EOF
 
-          # 3. MainActivity.kt (초절전/절전 상태 자동 감지 및 원클릭 해제 버튼 탑재)
-          cat << EOF > app/src/main/java/com/speed/s25subtitle/MainActivity.kt
+          cat << 'EOF' > app/src/main/java/com/speed/s25subtitle/MainActivity.kt
           package com.speed.s25subtitle
 
           import android.app.Activity
@@ -127,12 +119,16 @@ jobs:
 
           class MainActivity : Activity() {
               private lateinit var battBtn: Button
+              private val defaultChannel = "s25_paikham_live"
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
 
                   val prefs = getSharedPreferences("s25_sub_prefs", Context.MODE_PRIVATE)
-                  val savedChannel = prefs.getString("channel", "$CH_ID") ?: "$CH_ID"
+                  var savedChannel = prefs.getString("channel", defaultChannel) ?: defaultChannel
+                  if (savedChannel.isBlank() || savedChannel == "s25_sub_default") {
+                      savedChannel = defaultChannel
+                  }
                   val savedSize = prefs.getFloat("ko_size", 20f)
                   val savedDelay = prefs.getInt("delay_ms", 0)
 
@@ -147,7 +143,7 @@ jobs:
                   scroll.addView(root)
 
                   val title = TextView(this).apply {
-                      text = "📱 갤럭시 S25 투명 자막기 v2.0"
+                      text = "📱 갤럭시 S25 투명 자막기 v3.0"
                       textSize = 21f
                       setTextColor(Color.parseColor("#00FF7F"))
                       setTypeface(null, Typeface.BOLD)
@@ -155,7 +151,7 @@ jobs:
                   root.addView(title)
 
                   val desc = TextView(this).apply {
-                      text = "초절전 끊김 방지(WakeLock) 및 자동 재연결이 적용되었습니다."
+                      text = "PC와 채널 ID(s25_paikham_live)가 영구 통일되어 바로 연결됩니다."
                       textSize = 13f
                       setTextColor(Color.parseColor("#AAAAAA"))
                       setPadding(0, 12, 0, 28)
@@ -163,9 +159,9 @@ jobs:
                   root.addView(desc)
 
                   battBtn = Button(this).apply {
-                      textSize = 14f
+                      textSize = 13f
                       setTypeface(null, Typeface.BOLD)
-                      setPadding(0, 26, 0, 26)
+                      setPadding(0, 24, 0, 24)
                       setOnClickListener {
                           requestIgnoreBattery()
                       }
@@ -173,12 +169,12 @@ jobs:
                   val lpBatt = LinearLayout.LayoutParams(
                       LinearLayout.LayoutParams.MATCH_PARENT,
                       LinearLayout.LayoutParams.WRAP_CONTENT
-                  ).apply { bottomMargin = 32 }
+                  ).apply { bottomMargin = 28 }
                   root.addView(battBtn, lpBatt)
                   updateBatteryButtonState()
 
                   val chLabel = TextView(this).apply {
-                      text = "🔑 PC 직통 채널 ID"
+                      text = "🔑 PC 직통 채널 ID (자동 통일됨)"
                       textSize = 14f
                       setTextColor(Color.parseColor("#FFE600"))
                       setTypeface(null, Typeface.BOLD)
@@ -195,7 +191,7 @@ jobs:
                   root.addView(chInput)
 
                   val sizeLabel = TextView(this).apply {
-                      text = "📏 한국어 자막 크기: \${savedSize.toInt()}sp"
+                      text = "📏 한국어 자막 크기: ${savedSize.toInt()}sp"
                       textSize = 14f
                       setTextColor(Color.WHITE)
                       setPadding(0, 32, 0, 10)
@@ -207,7 +203,7 @@ jobs:
                       progress = (savedSize.toInt() - 14).coerceIn(0, 20)
                       setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                           override fun onProgressChanged(s: SeekBar?, p: Int, f: Boolean) {
-                              sizeLabel.text = "📏 한국어 자막 크기: \${14 + p}sp"
+                              sizeLabel.text = "📏 한국어 자막 크기: ${14 + p}sp"
                           }
                           override fun onStartTrackingTouch(s: SeekBar?) {}
                           override fun onStopTrackingTouch(s: SeekBar?) {}
@@ -216,7 +212,7 @@ jobs:
                   root.addView(sizeSeek)
 
                   val delayLabel = TextView(this).apply {
-                      text = "⏱️ 폰-PC 영상 싱크 지연: \${savedDelay / 1000.0}초"
+                      text = "⏱️ 폰-PC 영상 싱크 지연: ${savedDelay / 1000.0}초"
                       textSize = 14f
                       setTextColor(Color.WHITE)
                       setPadding(0, 24, 0, 10)
@@ -228,7 +224,7 @@ jobs:
                       progress = (savedDelay / 100).coerceIn(0, 50)
                       setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                           override fun onProgressChanged(s: SeekBar?, p: Int, f: Boolean) {
-                              delayLabel.text = "⏱️ 폰-PC 영상 싱크 지연: \${p / 10.0}초"
+                              delayLabel.text = "⏱️ 폰-PC 영상 싱크 지연: ${p / 10.0}초"
                           }
                           override fun onStartTrackingTouch(s: SeekBar?) {}
                           override fun onStopTrackingTouch(s: SeekBar?) {}
@@ -245,18 +241,12 @@ jobs:
                       setPadding(0, 34, 0, 34)
                       setOnClickListener {
                           if (!Settings.canDrawOverlays(this@MainActivity)) {
-                              Toast.makeText(this@MainActivity, "'다른 앱 위에 표시' 권한을 먼저 켜주세요!", Toast.LENGTH_LONG).show()
-                              startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:\$packageName")))
-                              return@setOnClickListener
-                          }
-                          val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !pm.isIgnoringBatteryOptimizations(packageName)) {
-                              Toast.makeText(this@MainActivity, "초절전 끊김 방지를 위해 배터리 '허용(제한 없음)'을 눌러주세요!", Toast.LENGTH_LONG).show()
-                              requestIgnoreBattery()
+                              Toast.makeText(this@MainActivity, "'다른 앱 위에 표시' 권한을 켜주세요!", Toast.LENGTH_LONG).show()
+                              startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
                               return@setOnClickListener
                           }
 
-                          val ch = chInput.text.toString().trim()
+                          val ch = chInput.text.toString().trim().ifEmpty { defaultChannel }
                           val sz = (14 + sizeSeek.progress).toFloat()
                           val dl = delaySeek.progress * 100
                           prefs.edit().putString("channel", ch).putFloat("ko_size", sz).putInt("delay_ms", dl).apply()
@@ -272,12 +262,11 @@ jobs:
                               } else {
                                   startService(svc)
                               }
-                              Toast.makeText(this@MainActivity, "투명 자막이 시작되었습니다!", Toast.LENGTH_SHORT).show()
-                              moveTaskToBack(true)
-                          } catch (e: Exception) {
-                              startService(svc)
-                              moveTaskToBack(true)
+                          } catch (_: Exception) {
+                              try { startService(svc) } catch (_: Exception) {}
                           }
+                          Toast.makeText(this@MainActivity, "투명 자막이 켜졌습니다!", Toast.LENGTH_SHORT).show()
+                          moveTaskToBack(true)
                       }
                   }
                   val lpStart = LinearLayout.LayoutParams(
@@ -315,12 +304,12 @@ jobs:
                   val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
                   val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) pm.isIgnoringBatteryOptimizations(packageName) else true
                   if (ok) {
-                      battBtn.text = "✅ 배터리 절전 제외됨 (백그라운드 무제한 작동)"
+                      battBtn.text = "✅ 배터리 절전 제외 완료 (끊김 없음)"
                       battBtn.setBackgroundColor(Color.parseColor("#143D29"))
                       battBtn.setTextColor(Color.parseColor("#00FF7F"))
                   } else {
-                      battBtn.text = "⚠️ 초절전/절전 상태 해제하기 (필수 터치!)"
-                      battBtn.setBackgroundColor(Color.parseColor("#662200"))
+                      battBtn.text = "⚡ 백그라운드 절전 해제 (터치 후 허용 권장)"
+                      battBtn.setBackgroundColor(Color.parseColor("#552200"))
                       battBtn.setTextColor(Color.parseColor("#FFE600"))
                   }
               }
@@ -329,7 +318,7 @@ jobs:
                   try {
                       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                           val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                              data = Uri.parse("package:\$packageName")
+                              data = Uri.parse("package:$packageName")
                           }
                           startActivity(intent)
                       }
@@ -342,7 +331,6 @@ jobs:
           }
           EOF
 
-          # 4. OverlayService.kt (WakeLock 상시 유지 + 12초 고속 하트비트 + 무중단 재연결)
           cat << 'EOF' > app/src/main/java/com/speed/s25subtitle/OverlayService.kt
           package com.speed.s25subtitle
 
@@ -379,7 +367,7 @@ jobs:
 
               private val sessionGen = AtomicInteger(0)
               private val uiHandler = Handler(Looper.getMainLooper())
-              private var channelId = ""
+              private var channelId = "s25_paikham_live"
               private var delayMs = 0
               private var showSource = true
 
@@ -392,7 +380,8 @@ jobs:
               override fun onBind(intent: Intent?): IBinder? = null
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-                  channelId = intent?.getStringExtra("channel") ?: "s25_sub_default"
+                  val inCh = intent?.getStringExtra("channel")?.trim()
+                  channelId = if (inCh.isNullOrEmpty() || inCh == "s25_sub_default") "s25_paikham_live" else inCh
                   val koSize = intent?.getFloatExtra("ko_size", 20f) ?: 20f
                   delayMs = intent?.getIntExtra("delay_ms", 0) ?: 0
 
@@ -423,8 +412,8 @@ jobs:
                           val ch = NotificationChannel(chId, "S25 무제한 자막 서비스", NotificationManager.IMPORTANCE_LOW)
                           nm.createNotificationChannel(ch)
                           val notif = Notification.Builder(this, chId)
-                              .setContentTitle("S25 무제한 투명 자막 작동 중")
-                              .setContentText("채널: $channelId (절전 방지 활성)")
+                              .setContentTitle("S25 투명 자막 작동 중")
+                              .setContentText("채널: $channelId")
                               .setSmallIcon(android.R.drawable.ic_media_play)
                               .build()
                           startForeground(1001, notif)
@@ -445,7 +434,7 @@ jobs:
                   }
 
                   srcView = OutlinedTextView(this).apply {
-                      text = "[$channelId] 실시간 서버 연결 중..."
+                      text = "[$channelId] 서버 연결 중..."
                       textSize = (koSize * 0.62f).coerceAtLeast(11f)
                       setTextColor(Color.parseColor("#DDDDDD"))
                       strokeWidthPx = 6f
@@ -564,7 +553,7 @@ jobs:
               private fun buildConnectPacket(clientId: String): ByteArray {
                   val cid = clientId.toByteArray(Charsets.UTF_8)
                   val body = ByteArrayOutputStream()
-                  body.write(byteArrayOf(0x00, 0x04, 'M'.code.toByte(), 'Q'.code.toByte(), 'T'.code.toByte(), 'T'.code.toByte(), 0x04, 0x02, 0x00, 0x1e))
+                  body.write(byteArrayOf(0x00, 0x04, 'M'.code.toByte(), 'Q'.code.toByte(), 'T'.code.toByte(), 'T'.code.toByte(), 0x04, 0x02, 0x00, 0x19))
                   body.write((cid.size shr 8) and 0xFF)
                   body.write(cid.size and 0xFF)
                   body.write(cid)
@@ -614,7 +603,7 @@ jobs:
                               sock.keepAlive = true
                               sock.tcpNoDelay = true
                               sock.connect(InetSocketAddress(host, 1883), 4000)
-                              sock.soTimeout = 12000
+                              sock.soTimeout = 10000
 
                               val out = sock.getOutputStream()
                               val input = sock.getInputStream()
@@ -632,14 +621,17 @@ jobs:
 
                               uiHandler.post {
                                   if (sessionGen.get() == myGen) {
-                                      srcView.text = "[$channelId] 🟢 실시간 수신 중 ($host)"
+                                      srcView.text = "[$channelId] 🟢 실시간 연결 완료 ($host)"
                                   }
                               }
+
+                              var awaitingPingResp = false
 
                               while (sessionGen.get() == myGen) {
                                   try {
                                       val header = input.read()
                                       if (header == -1) throw EOFException()
+                                      awaitingPingResp = false
 
                                       var multiplier = 1
                                       var remLen = 0
@@ -683,13 +675,17 @@ jobs:
                                           }
                                       }
                                   } catch (_: SocketTimeoutException) {
+                                      if (awaitingPingResp) {
+                                          throw EOFException("Ping timeout - reconnecting")
+                                      }
+                                      awaitingPingResp = true
                                       out.write(byteArrayOf(0xC0.toByte(), 0x00.toByte()))
                                       out.flush()
                                   }
                               }
                           } catch (_: Exception) {
                               bIdx++
-                              try { Thread.sleep(800) } catch (_: Exception) {}
+                              try { Thread.sleep(600) } catch (_: Exception) {}
                           } finally {
                               try { sock?.close() } catch (_: Exception) {}
                           }
@@ -724,7 +720,7 @@ jobs:
 
           gradle assembleDebug --no-daemon
 
-      - name: Publish Direct APK to Repo Root (For Instant QR Download)
+      - name: Publish Direct APK to Repo Root
         run: |
           APK_PATH=$(find . -name "app-debug.apk" | head -n 1)
           if [ -n "$APK_PATH" ]; then
@@ -733,7 +729,7 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add S25_Subtitle_Overlay.apk
-            git commit -m "Auto-publish S25_Subtitle_Overlay.apk for QR download" || true
+            git commit -m "Publish v3.0 APK" || true
             git push origin HEAD:main || true
           fi
 
